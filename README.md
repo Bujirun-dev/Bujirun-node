@@ -31,6 +31,27 @@
 | `REDIS_HOST` | `localhost` | Redis 호스트 |
 | `REDIS_PORT` | `6379` | Redis 포트 |
 | `REDIS_PASSWORD` | — | Redis 비밀번호 (없으면 생략) |
+| `JWT_SECRET` | — (필수) | bujirun-backend의 `jwt.secret`과 동일한 값 |
+| `SPRING_API_BASE_URL` | `http://spring-boot:8080` | bujirun-backend REST API 주소 (권한 확인용) |
+
+---
+
+## 인증
+
+WebSocket 연결 시 접속 토큰과 접근 권한을 검증한다. 인증 로직은 `auth.js`에 있다.
+
+1. JWT 서명/만료 검증 (`JWT_SECRET`, bujirun-backend와 동일한 HS256 시크릿)
+2. `GET {SPRING_API_BASE_URL}/api/itineraries/{itineraryId}`를 해당 토큰으로 호출해 실제 접근 권한이 있는지 확인
+
+소유자/그룹멤버 판단 로직은 여기서 중복 구현하지 않고 bujirun-backend에 전적으로 위임한다 (`ItineraryService.validateAccess` 기준 — 소유자 또는 같은 그룹의 멤버면 통과).
+
+두 검증 중 하나라도 실패하면 WebSocket 업그레이드 자체를 거부한다.
+
+| 상황 | 응답 |
+|---|---|
+| 토큰 없음 / 서명 무효 / 만료 | `401` |
+| 토큰은 유효하지만 해당 itinerary에 접근 권한 없음 | `401` |
+| room 이름이 UUID 형식이 아님 | `400` |
 
 ---
 
@@ -59,21 +80,31 @@ npm install yjs y-websocket
 
 ### 연결
 
+접속 시 로그인 토큰(`accessToken`)을 `params`로 반드시 함께 보내야 한다. 토큰이 없거나
+이 유저가 해당 일정에 접근 권한이 없으면 서버가 연결을 거부한다 ([인증](#인증) 참고).
+
 ```js
 import * as Y from 'yjs'
 import { WebsocketProvider } from 'y-websocket'
 
 const itineraryId = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' // 백엔드에서 받은 UUID
+const accessToken = '...' // 로그인 시 발급받은 JWT
 
 const doc = new Y.Doc()
 const provider = new WebsocketProvider(
   'ws://localhost:1234',
   itineraryId,          // room 이름 = itinerary UUID
-  doc
+  doc,
+  { params: { token: accessToken } }
 )
 
 provider.on('status', ({ status }) => {
   console.log('연결 상태:', status) // 'connecting' | 'connected' | 'disconnected'
+})
+
+// 인증/권한 실패로 연결이 거부된 경우 여기로 들어온다 (401/400)
+provider.ws?.addEventListener?.('unexpected-response', (e) => {
+  console.error('연결 거부:', e)
 })
 ```
 
