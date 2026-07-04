@@ -2,9 +2,10 @@ const http = require('http')
 const { WebSocketServer } = require('ws')
 const { setupWSConnection } = require('y-websocket/bin/utils')
 const { RedisPersistence } = require('y-redis')
+const { authorize } = require('./auth')
 
 // 허용되는 room 이름: itinerary UUID만 허용 (보안)
-const UUID_REGEX = /^\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\/.*)?$/i
+const UUID_REGEX = /^\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(\/.*)?$/i
 
 const redisOpts = {
   host: process.env.REDIS_HOST || 'localhost',
@@ -19,16 +20,36 @@ const server = http.createServer((req, res) => {
   res.end('ok')
 })
 
-const wss = new WebSocketServer({ server })
+const wss = new WebSocketServer({ noServer: true })
 
-wss.on('connection', (ws, req) => {
-  const pathname = new URL(req.url, 'http://localhost').pathname
+server.on('upgrade', async (req, socket, head) => {
+  const url = new URL(req.url, 'http://localhost')
+  const match = UUID_REGEX.exec(url.pathname)
 
-  if (!UUID_REGEX.test(pathname)) {
-    ws.close(1008, 'Invalid room: must be an itinerary UUID')
+  if (!match) {
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n')
+    socket.destroy()
     return
   }
 
+  const itineraryId = match[1]
+  const token = url.searchParams.get('token')
+
+  try {
+    await authorize(token, itineraryId)
+  } catch (e) {
+    console.warn(`[auth] 연결 거부 — itineraryId=${itineraryId}: ${e.message}`)
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
+    socket.destroy()
+    return
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req)
+  })
+})
+
+wss.on('connection', (ws, req) => {
   setupWSConnection(ws, req, { gc: true, persistence })
 })
 
