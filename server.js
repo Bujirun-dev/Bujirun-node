@@ -61,8 +61,13 @@ server.listen(PORT, () => {
 
 async function shutdown() {
   console.log('Shutting down...')
+  // 연결된 클라이언트가 있으면 server.close()의 콜백이 그 연결들이 끊길 때까지
+  // 영원히 안 불려서 process.exit이 실행되지 않고 프로세스가 좀비로 남는다 —
+  // 클라이언트를 먼저 강제로 끊고, 그래도 안 죽으면 타임아웃으로 강제 종료한다.
+  wss.clients.forEach((ws) => ws.close(1001, 'Server shutting down'))
   await persistence.destroy()
   server.close(() => process.exit(0))
+  setTimeout(() => process.exit(0), 5000).unref()
 }
 
 process.on('SIGTERM', shutdown)
