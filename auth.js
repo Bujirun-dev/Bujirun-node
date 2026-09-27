@@ -15,13 +15,16 @@ if (!JWT_SECRET) {
  *
  * @param {string} token JWT access token
  * @param {string} itineraryId room 이름 (=itineraryId)
+ * @returns {Promise<string>} 토큰에서 추출한 userId(sub 클레임) — RoomFlushManager가
+ *   flush 요청의 actorUserId를 고르는 데 쓴다(3단계, 2026-09-17 추가).
  * @throws {Error} 토큰이 유효하지 않거나 접근 권한이 없으면 예외
  */
 async function authorize (token, itineraryId) {
   if (!token) throw new Error('토큰이 없습니다')
 
+  let payload
   try {
-    jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] })
+    payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] })
   } catch (e) {
     throw new Error('유효하지 않은 토큰입니다: ' + e.message)
   }
@@ -33,6 +36,8 @@ async function authorize (token, itineraryId) {
   if (!res.ok) {
     throw new Error(`일정 접근 권한이 없습니다 (status=${res.status})`)
   }
+
+  return payload.sub
 }
 
 module.exports = { authorize }
