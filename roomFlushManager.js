@@ -50,6 +50,8 @@ class RoomFlushManager {
     this.dayVersions = new Map()
     // day별 마지막으로 성공한 flush의 payload 서명. 같으면 변경 없음으로 보고 스킵한다.
     this.lastFlushedSignature = new Map()
+    // day별로 서버가 4xx로 거부한 payload 서명. 내용이 바뀌기 전까지는 재전송하지 않는다.
+    this.rejectedSignature = new Map()
     // 지금 이 room에 연결된 유저id 집합. Spring의 validateAccess는 "소유자 또는 그룹원"만
     // 확인하므로, 지금 방에 있는 사람이면 누구든 actorUserId로 써도 권한상 안전하다.
     this.activeUserIds = new Set()
@@ -139,6 +141,7 @@ class RoomFlushManager {
     const actorUserId = actorUserIdOverride ?? this.pickActorUserId()
     if (!actorUserId) return // 방에 아무도 없다 — 이탈 시 flush는 override로 별도 처리됨
     try {
+      this.dedupeDayItems()
       const days = extractDays(this.doc)
       for (const { dayId, items } of days) {
         if (!dayId) continue
@@ -159,6 +162,9 @@ class RoomFlushManager {
     const signature = JSON.stringify(orderedInputs)
     if (!isConflictRetry && this.lastFlushedSignature.get(dayId) === signature) {
       return // 변경 없음 — flush 대상에서 제외
+    }
+    if (!isConflictRetry && this.rejectedSignature.get(dayId) === signature) {
+      return // 서버가 이미 거부한(4xx) 내용 그대로 — 바뀔 때까지 다시 보내지 않는다
     }
 
     const operationId = await computeOperationId(dayId, orderedInputs)
@@ -191,6 +197,7 @@ class RoomFlushManager {
       const resolvedItems = extractDays(this.doc).find((d) => d.dayId === dayId)?.items ?? []
       const resolvedFiltered = resolvedItems.filter((item) => item.spotId)
       this.lastFlushedSignature.set(dayId, JSON.stringify(toReplacePayload(resolvedFiltered)))
+      this.rejectedSignature.delete(dayId)
       this.broadcastSaveStatus('saved')
       return
     }
@@ -208,13 +215,22 @@ class RoomFlushManager {
     console.error(
       `[flush] room=${this.itineraryId} day=${dayId} 실패 status=${result.status} ${result.message ?? ''}`,
     )
+    // 400/403 등은 같은 내용을 다시 보내도 똑같이 거부된다 — 30초 주기마다 같은 요청을
+    // 반복하며 실패 안내를 계속 띄우던 문제(2026-09-29 운영)를 막는다.
+    if (result.status >= 400 && result.status < 500) this.rejectedSignature.set(dayId, signature)
     this.broadcastSaveStatus('error')
   }
 
   // 성공 응답의 items[i]는 요청으로 보낸 orderedInputs[i](=filteredItems[i])와 같은 순서다
-  // (백엔드 replaceDayItems가 요청 순서대로 결과를 만듦). temp- id였던 로컬 항목만 그
-  // 위치의 실제 id로 바꿔 쓴다 — 이미 실제 id였던 항목은 그대로 둔다. 그 사이 다른 편집으로
-  // 해당 temp 항목이 사라졌으면(동시 삭제 등) find가 못 찾아서 조용히 스킵된다.
+  // (백엔드 replaceDayItems가 요청 순서대로 결과를 만듦). 로컬 id가 그 위치의 실제 id와
+  // 다르면 실제 id로 바꿔 쓴다.
+  //
+  // id 문자열로 항목을 다시 찾지 않고, 요청을 만들 때 읽은 그 Y.Map에 직접 쓴다. 예전엔
+  // maps.find(id)로 찾았는데, 로그 불러오기가 브라우저마다 temp-1부터 id를 매겨 두 사람이
+  // 동시에 불러오면 같은 temp id가 여럿 생겨 엉뚱한 항목에 실제 id가 붙었다(2026-09-29 운영).
+  // 또 temp가 아니어도 이 day에 없는 id(다른 day에서 옮겨온 항목 등)는 서버가 새 행으로
+  // 만들므로, 응답 id와 다르면 그 값으로 맞춘다 — 안 그러면 로컬 id가 DB에 없는 채로 남아
+  // travel-mode 조회가 404가 나고 저장할 때마다 행을 새로 만든다.
   resolveTempIds (dayId, filteredItems, resultItems) {
     if (!resultItems) return
     const daysArray = this.doc.getArray('days')
@@ -222,15 +238,43 @@ class RoomFlushManager {
     if (dayIdx < 0) return
     const itemsArray = daysArray.get(dayIdx).get('items')
     if (!itemsArray) return
-    const maps = itemsArray.toArray()
+    const liveMaps = new Set(itemsArray.toArray())
 
     this.doc.transact(() => {
       filteredItems.forEach((localItem, index) => {
-        if (typeof localItem.id !== 'string' || !localItem.id.startsWith('temp-')) return
         const real = resultItems[index]
-        if (!real?.id) return
-        const map = maps.find((m) => m.get('id') === localItem.id)
-        if (map) map.set('id', real.id)
+        if (!real?.id || real.id === localItem.id) return
+        const map = localItem.map
+        // 요청 중에 삭제됐거나 다른 편집으로 id가 이미 바뀐 항목은 건드리지 않는다.
+        if (!map || !liveMaps.has(map) || map.get('id') !== localItem.id) return
+        map.set('id', real.id)
+      })
+    }, this)
+  }
+
+  // 같은 day 안에 id가 같은 항목이 둘 이상이면 앞의 것만 남긴다. 두 사람이 같은 로그를
+  // 동시에 불러오면 각자 넣은 항목이 Yjs에서 둘 다 살아남는데, 프론트가 로그 항목 기준으로
+  // 정해진 임시 id(temp-log-…)를 쓰므로 이 경우 id가 같다 — 그대로 두면 관광지가 두 배로
+  // 저장되고 같은 시각이 겹친다(2026-09-29 운영). 같은 관광지를 일부러 두 번 넣은 항목은
+  // id가 서로 달라서 건드리지 않는다.
+  dedupeDayItems () {
+    const daysArray = this.doc.getArray('days')
+    this.doc.transact(() => {
+      daysArray.toArray().forEach((dayMap) => {
+        const itemsArray = dayMap.get('items')
+        if (!itemsArray) return
+        const seen = new Set()
+        const duplicateIdx = []
+        itemsArray.toArray().forEach((map, idx) => {
+          const id = map.get('id')
+          if (typeof id !== 'string') return
+          if (seen.has(id)) duplicateIdx.push(idx)
+          else seen.add(id)
+        })
+        for (let i = duplicateIdx.length - 1; i >= 0; i -= 1) itemsArray.delete(duplicateIdx[i], 1)
+        if (duplicateIdx.length > 0) {
+          console.warn(`[flush] room=${this.itineraryId} day=${dayMap.get('dayId')} 같은 id 항목 ${duplicateIdx.length}개 정리`)
+        }
       })
     }, this)
   }

@@ -15,6 +15,9 @@ function extractDays (doc) {
       id: itemMap.get('id'),
       spotId: itemMap.get('spotId'),
       time: itemMap.get('time'),
+      // flush 응답의 실제 id를 "이 항목"에 정확히 되돌려 쓰기 위한 참조(resolveTempIds).
+      // payload/서명에는 들어가지 않는다(toReplacePayload가 필요한 필드만 골라 씀).
+      map: itemMap,
     }))
     return { dayId, items }
   })
