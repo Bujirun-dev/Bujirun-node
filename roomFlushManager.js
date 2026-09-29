@@ -2,7 +2,10 @@ const Y = require('yjs')
 const springClient = require('./springClient')
 const { extractDays, toReplacePayload, computeOperationId } = require('./dayFlush')
 
-const DEBOUNCE_MS = 5000
+// 프론트가 직접 flush하던 시절의 디바운스(2초)와 맞춘다. 새로 추가한 관광지의 교통수단
+// 배너는 flush 성공 신호를 받은 뒤에 채워지므로(프론트 useTransportBackfill), 이 값이 곧
+// 배너가 뜨기까지의 지연이 된다.
+const DEBOUNCE_MS = 2000
 const PERIODIC_MS = 30000
 
 // a, b 공통으로 등장하는 id 중 "양쪽에서 같은 상대 순서를 유지하는" 가장 긴 부분수열을
